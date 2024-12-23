@@ -1,9 +1,10 @@
 import os
-from torch_scatter import scatter_add, scatter_mean
 from torch import nn
 import torch
 import math
 from torch_geometric.nn import GATConv
+from torch_geometric.nn import TopKPooling
+from torch_scatter import scatter_add, scatter_mean
 
 ligand_atom_types = ['H', 'C', 'N', 'O', 'F', 'P', 'S', 'Cl']
 ligand_atom_add_aromatic_types = ['H', 'C1', 'C2', 'N1', 'N2', 'O1', 'O2', 'F', 'P1', 'P2', 'S1', 'S2', 'Cl']
@@ -29,9 +30,7 @@ def remove_mean_batch_ligand(x_lig, x_pocket, lig_indices, pocket_indices):
 
 def remove_lig_mean_batch_ligand(x_lig, x_pocket, lig_indices, pocket_indices):
 
-    # Just subtract the center of mass of the sampled part
     lig_mean = scatter_mean(x_lig, lig_indices, dim=0)
-    # pocket_mean = scatter_mean(x_pocket, pocket_indices, dim=0)
 
     x_lig = x_lig - lig_mean[lig_indices]
     x_pocket = x_pocket - lig_mean[pocket_indices]
@@ -39,24 +38,22 @@ def remove_lig_mean_batch_ligand(x_lig, x_pocket, lig_indices, pocket_indices):
 
 def remove_pocket_mean_batch_ligand(x_lig, x_pocket, lig_indices, pocket_indices):
 
-    # Just subtract the center of mass of the sampled part
-    # lig_mean = scatter_mean(x_lig, lig_indices, dim=0)
     pocket_mean = scatter_mean(x_pocket, pocket_indices, dim=0)
 
     x_lig = x_lig - pocket_mean[lig_indices]
     x_pocket = x_pocket - pocket_mean[pocket_indices]
     return x_lig, x_pocket
 
-
-class Normal_BAPNet(nn.Module):
+class Relative_BAPNet(nn.Module):
     def __init__(self, ckpt_path=None,
                  hidden_nf: int = 128,
-                 act_fn=nn.SiLU(), GAT_head: int = 2, graph_layers: int = 1,
+                 act_fn=nn.SiLU(), GAT_head: int = 2, graph_layers: int = 1, 
                  attention=False,
                  norm_diff=True, tanh=False, coords_range=15, norm_constant=1, inv_sublayers=1,
                  sin_embedding=False, normalization_factor=100, aggregation_method='sum',
                  edge_cutoff=None, ignore_keys: list = []):
-        super(Normal_BAPNet, self).__init__()
+        super(Relative_BAPNet, self).__init__()
+        
         graph_dim = hidden_nf
         self.graph_dim = graph_dim
         self.hidden_nf = hidden_nf
@@ -81,11 +78,20 @@ class Normal_BAPNet(nn.Module):
             edge_feat_nf = self.sin_embedding.dim * 2
         else:
             self.sin_embedding = None
-            edge_feat_nf = 2        
+            edge_feat_nf = 2       
 
         self.ComplexesGraph = nn.ModuleList([
-            GATConv(graph_dim, graph_dim, GAT_head, concat=False)
+            EquivariantBlock(hidden_nf, edge_feat_nf=edge_feat_nf,
+                act_fn=act_fn, n_layers=inv_sublayers,
+                attention=attention, norm_diff=norm_diff, tanh=tanh,
+                coords_range=coords_range,
+                norm_constant=norm_constant,
+                sin_embedding=self.sin_embedding,
+                normalization_factor=self.normalization_factor,
+                aggregation_method=self.aggregation_method)
+
         ])
+
         self.LigandGraph = nn.ModuleList([
             EquivariantBlock(hidden_nf, edge_feat_nf=edge_feat_nf,
                 act_fn=act_fn, n_layers=inv_sublayers,
@@ -108,12 +114,19 @@ class Normal_BAPNet(nn.Module):
                 normalization_factor=self.normalization_factor,
                 aggregation_method=self.aggregation_method)
 
-        ])
+        ])        
 
         for layer_i in range(graph_layers - 1):
             self.ComplexesGraph.append(
-                    GATConv(graph_dim, graph_dim, GAT_head, concat=False)
-            )
+                EquivariantBlock(hidden_nf, edge_feat_nf=edge_feat_nf,
+                act_fn=act_fn, n_layers=inv_sublayers,
+                attention=attention, norm_diff=norm_diff, tanh=tanh,
+                coords_range=coords_range,
+                norm_constant=norm_constant,
+                sin_embedding=self.sin_embedding,
+                normalization_factor=self.normalization_factor,
+                aggregation_method=self.aggregation_method))
+
             self.LigandGraph.append(
                 EquivariantBlock(hidden_nf, edge_feat_nf=edge_feat_nf,
                 act_fn=act_fn, n_layers=inv_sublayers,
@@ -134,10 +147,6 @@ class Normal_BAPNet(nn.Module):
                 normalization_factor=self.normalization_factor,
                 aggregation_method=self.aggregation_method))
 
-
-        self.GeoGraph = nn.ModuleList([])
-        self.GeoGraph.append(GATConv(graph_dim, graph_dim, GAT_head, concat=False))
-
         self.FusionGraph = nn.ModuleList([])
         self.FusionGraph.append(GATConv(graph_dim * 2, graph_dim * 1, GAT_head, concat=False))
 
@@ -147,12 +156,9 @@ class Normal_BAPNet(nn.Module):
         assert ckpt_path is not None, "ckpt_path is None"
         assert os.path.exists(ckpt_path), "ckpt_path is not exist"
         if ckpt_path is not None:
-            # load the pretrained model
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
-            # freeze the pretrained model
             self.freeze_the_model()
 
-    # freeze the weights of the loaded pretrained model
     def freeze_the_model(self):
         self.eval()
         for param in self.parameters():
@@ -174,19 +180,19 @@ class Normal_BAPNet(nn.Module):
 
     @torch.no_grad()
     def extract_features(self, lig_coords, pocket_coords, lig_a_hidx, pocket_a_hidx, pocket_r_hidx, lig_mask, pocket_mask):
-        lig_coords, pocket_coords = remove_mean_batch_ligand(lig_coords, pocket_coords, lig_mask, pocket_mask)
-
+        
+        lig_coords, pocket_coords = remove_pocket_mean_batch_ligand(lig_coords, pocket_coords, lig_mask, pocket_mask)
+        
         device = lig_coords.device
         num_lig = lig_coords.shape[0]
 
-        # obtain complexes by combining ligand and pocket
         complexes_mask = torch.cat([lig_mask, pocket_mask], dim=0)
         complexes_coords = torch.cat([lig_coords, pocket_coords], dim=0).to(torch.float32)
         complexes_id = torch.LongTensor([0] * lig_coords.shape[0] + [1] * pocket_coords.shape[0]).to(device)
 
-        lig_atom_type = lig_a_hidx  # index for atom types
-        pocket_atom_type = pocket_a_hidx  # index for residue types
-        pocket_residue_type = pocket_r_hidx  # index for residue types
+        lig_atom_type = lig_a_hidx
+        pocket_atom_type = pocket_a_hidx
+        pocket_residue_type = pocket_r_hidx
 
         complexes_id_emb = self.id_embed(complexes_id)
         lig_atom_type_emb = self.ligand_atom_type_embed(lig_atom_type)
@@ -200,28 +206,27 @@ class Normal_BAPNet(nn.Module):
         complexes_emb = torch.cat([complexes_type_emb, complexes_id_emb], dim=-1)
         complexes_emb = self.embed_fusion(complexes_emb)
 
-        # inter-modal: fully connection
         complexes_edge_index = get_edges(mask=complexes_mask).cpu()
         complexes_edge_index = torch.LongTensor(complexes_edge_index).to(device)
 
-        # build up a graph for ligand
         ligand_edge_index = get_edges(mask=lig_mask).cpu()
         ligand_edge_index = torch.LongTensor(ligand_edge_index).to(device)
 
-        # build up a graph for complexes
         pocket_edge_index = get_edges(mask=pocket_mask).cpu()
         pocket_edge_index = torch.LongTensor(pocket_edge_index).to(device)
 
         complexes_emb_ = complexes_emb.clone()
         lig_emb, pocket_emb = complexes_emb_[: num_lig], complexes_emb_[num_lig:]
 
+        complexes_distances, _ = coord2diff(complexes_coords, complexes_edge_index)
+        if self.sin_embedding is not None:
+            complexes_distances = self.sin_embedding(complexes_distances)
+
         pocket_distances, _ = coord2diff(pocket_coords, pocket_edge_index)
-        # gt_pocket_distance_map = pocket_distances.view(-1, 1)
         if self.sin_embedding is not None:
             pocket_distances = self.sin_embedding(pocket_distances)
 
         lig_distances, _ = coord2diff(lig_coords, ligand_edge_index)
-        # gt_pocket_distance_map = pocket_distances.view(-1, 1)
         if self.sin_embedding is not None:
             lig_distances = self.sin_embedding(lig_distances)
 
@@ -231,24 +236,18 @@ class Normal_BAPNet(nn.Module):
             LigLayer = self.LigandGraph[i]
             PocketLayer = self.PocketGraph[i]
 
-            # sequence branch
-            O_C = CompLayer(O_C, complexes_edge_index)
-
-            # geometry branch
+            O_C, complexes_coords = CompLayer(O_C, complexes_coords, complexes_edge_index, node_mask=None, edge_mask=None,
+                    edge_attr=complexes_distances, update_coords_mask=None)
             O_L, lig_coords = LigLayer(O_L, lig_coords, ligand_edge_index, node_mask=None, edge_mask=None,
                     edge_attr=lig_distances, update_coords_mask=None)
             O_P, pocket_coords = PocketLayer(O_P, pocket_coords, pocket_edge_index, node_mask=None, edge_mask=None,
                     edge_attr=pocket_distances, update_coords_mask=None)
 
-        # fusion branch for fusing both geometry and sequence information
-        GeoLayer = self.GeoGraph[0]
         FusionLayer = self.FusionGraph[0]
 
         O_LP = torch.cat([O_L, O_P], dim=0)
-
-        O_LP = GeoLayer(O_LP, complexes_edge_index)
         O_C = FusionLayer(torch.cat([O_C, O_LP], dim=1), complexes_edge_index)
-
+        
         return O_C[:num_lig].detach(), O_C[num_lig:].detach()
 
 
@@ -278,7 +277,7 @@ class GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, edge_attr, edge_mask):
-        if edge_attr is None:  # Unused.
+        if edge_attr is None:
             out = torch.cat([source, target], dim=1)
         else:
             out = torch.cat([source, target, edge_attr], dim=1)
@@ -386,7 +385,6 @@ class EquivariantBlock(nn.Module):
                                                        aggregation_method=self.aggregation_method))
 
     def forward(self, h, x, edge_index, node_mask=None, edge_mask=None, edge_attr=None, update_coords_mask=None):
-        # Edit Emiel: Remove velocity as input
         distances, coord_diff = coord2diff(x, edge_index, self.norm_constant)
         if self.sin_embedding is not None:
             distances = self.sin_embedding(distances)
@@ -397,17 +395,17 @@ class EquivariantBlock(nn.Module):
         x = self._modules["gcl_equiv"](h, x, edge_index, coord_diff, edge_attr,
                                        node_mask, edge_mask, update_coords_mask=update_coords_mask)
 
-        # Important, the bias of the last linear might be non-zero
         if node_mask is not None:
             h = h * node_mask
         return h, x
+
 
 
 class SinusoidsEmbeddingNew(nn.Module):
     def __init__(self, max_res=15., min_res=15. / 2000., div_factor=4):
         super().__init__()
         self.n_frequencies = int(math.log(max_res / min_res, div_factor)) + 1
-        self.frequencies = 2 * math.pi * div_factor ** torch.arange(self.n_frequencies) / max_res
+        self.frequencies = 2 * math.pi * div_factor ** torch.arange(self.n_frequencies)/max_res
         self.dim = len(self.frequencies) * 2
 
     def forward(self, x):
@@ -422,16 +420,13 @@ def coord2diff(x, edge_index, norm_constant=1):
     coord_diff = x[row] - x[col]
     radial = torch.sum((coord_diff) ** 2, 1).unsqueeze(1)
     norm = torch.sqrt(radial + 1e-8)
-    coord_diff = coord_diff / (norm + norm_constant)
+    coord_diff = coord_diff/(norm + norm_constant)
     return radial, coord_diff
 
 
 def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, aggregation_method: str):
-    """Custom PyTorch op to replicate TensorFlow's `unsorted_segment_sum`.
-        Normalization: 'sum' or 'mean'.
-    """
     result_shape = (num_segments, data.size(1))
-    result = data.new_full(result_shape, 0)  # Init empty result tensor.
+    result = data.new_full(result_shape, 0)
     segment_ids = segment_ids.unsqueeze(-1).expand(-1, data.size(1))
     result.scatter_add_(0, segment_ids, data)
     if aggregation_method == 'sum':
